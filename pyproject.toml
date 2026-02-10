@@ -1,0 +1,37 @@
+[tool.poetry]
+name = "dynamic_dags"
+version = "0.1.0"
+description = ""
+authors = ["PowerX AI <info@powerx.ai>"]
+readme = "README.md"
+
+[tool.poetry.dependencies]
+# This is the version of the Docker image that the Airflow helm chart uses
+python = ">=3.12.2,<3.13"
+boto = "^2.49.0"
+apache-airflow-providers-cncf-kubernetes = "^10.0.0"
+apache-airflow = {version = "3.1.6", extras = ["amazon"]}
+
+
+[tool.poetry.group.dev.dependencies]
+poethepoet = "^0.26.0"
+pytest = "^8.2.0"
+ruff = "^0.7.3"
+pyright = "^1.1.407"
+pytest-cov = "^5.0.0"
+pytest-ruff = "^0.3.1"
+psycopg2-binary = "^2.9.10"
+
+[build-system]
+requires = ["poetry-core"]
+build-backend = "poetry.core.masonry.api"
+
+[tool.poe.tasks]
+format_type = ["format", "typecheck"]
+format_type_test = ["format", "typecheck", "test"]
+
+
+
+[tool.poe.tasks.test]
+cmd = "pytest --cov=dynamic_dags --cov-report term-missing --ruff --ruff-format -s -vv --cache-clear tests/"
+env = { AWS_ROLE_ARN = "arn:aws:iam::770296051191:role/DevAdmin" }
