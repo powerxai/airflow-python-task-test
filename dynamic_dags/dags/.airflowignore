@@ -1,2 +1,3 @@
-powerx_dag_common/*
-powerx_plugins/*
+lib/*
+plugins/*
+utils/*

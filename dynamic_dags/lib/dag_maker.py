@@ -64,14 +64,9 @@ class AirFlowDagCreator:
         model: str,
         cron_schedule: str,
         dag_tags: list[str],
-        model_dag_name_suffix: Optional[str] = None,
         start_ts: Optional[datetime] = None,
         end_ts: Optional[datetime] = None,
-        docker_image: Optional[str] = None,
-        image_command: Optional[list[str]] = None,
         env_vars: dict[str, str] = dict(),
-        service_account_name: Optional[str] = None,
-        image_command_args: Optional[list[str]] = None,
         processing_window_hours: float = 24,
         processing_window_lag: int = 0,
         batch_info: Optional[BatchInfo] = None,
@@ -88,9 +83,8 @@ class AirFlowDagCreator:
         schedule_jitter_minutes: int = 15,
     ):
         self.model = model
-        self.model_dag_name_suffix = model_dag_name_suffix or ""
 
-        self.dag_name = f"{self.model}{self.model_dag_name_suffix}"
+        self.dag_name = self.model
 
         # Keep the original cron schedule (no modification)
         # Jitter will be applied in the SlidingWindowTimetable instead
@@ -106,12 +100,10 @@ class AirFlowDagCreator:
         else:
             self.jitter_amount = 0.0
 
-        self.docker_image = docker_image or os.environ["LIONFISH_DOCKER_IMAGE"]
         self.start_ts = start_ts
         self.dag_tags = set(dag_tags)
         self.end_ts = end_ts
 
-        # Common env vars in one location.
         self.env_vars = {
             "EVENTS_TOPIC": os.environ["KAFKA_EVENTS_TOPIC"],
             "KAFKA_AWS_SECRET_NAME": os.environ["LIONFISH_KAFKA_ARN"],
@@ -131,25 +123,21 @@ class AirFlowDagCreator:
             "ATC_CLIENT_ID": os.environ["ATC_CLIENT_ID"],
         } | env_vars
 
-        self.service_account_name = (
-            service_account_name or os.environ["SERVICE_ACCOUNT_NAME"]
-        )
+        self.service_account_name = os.environ["SERVICE_ACCOUNT_NAME"]
         self.processing_window_hours = processing_window_hours
         self.processing_window_lag = processing_window_lag
         self.batch_info = batch_info
         self.batch_metric_codes_info = batch_metric_codes_info
         self.k8s_pod_resources = k8s_pod_resources
-        self.image_command_args = image_command_args
         self.task_retries = task_retries
         self.retry_delay_seconds = retry_delay_seconds
         self.retry_exponential_backoff = retry_exponential_backoff
         self.startup_timeout_seconds = startup_timeout_seconds
         self.dry_run = dry_run
         self.max_active_tasks = max_active_tasks
-        self.image_command = image_command
         self.catchup = catchup
 
-        self.base_image_args = self.image_command_args or [
+        self.base_image_args = [
             "--model",
             self.model,
             "--window_start_timestamp",
@@ -516,9 +504,9 @@ class AirFlowDagCreator:
                     "task_id": f"{self.dag_name}_k8s_task_{task_index}",
                     "namespace": os.environ["KUBERNETES_NAMESPACE"],
                     "service_account_name": self.service_account_name,
-                    "image": self.docker_image,
+                    "image": os.environ["LIONFISH_DOCKER_IMAGE"],
                     "image_pull_policy": "Always",
-                    "cmds": self.image_command or ["python", "-m", "lionfish2"],
+                    "cmds": ["python", "-m", "lionfish2"],
                     "arguments": self.base_image_args,
                     "node_selector": {"powerx.ai/workload": "general-x64"},
                     "annotations": {
