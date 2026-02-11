@@ -9,7 +9,7 @@ from airflow.providers.cncf.kubernetes.operators.pod import (
 )
 from airflow.sdk import BaseOperator, Context, DAG, Param
 from airflow.sdk.definitions.param import ParamsDict
-from airflow.sdk.definitions.decorators import task
+from airflow.sdk.definitions.decorators import task, dag
 
 from kubernetes.client.models import V1ResourceRequirements
 
@@ -49,6 +49,21 @@ class PodResources(NamedTuple):
     cpu_request: int = 1000
     ram_request: int = 4000
 
+class _SiteIdsKubernetesPodOperator(KubernetesPodOperator):
+    """
+    KubernetesPodOperator that exposes site_ids in the Airflow UI by adding
+    them to template_fields. Used when building mapped K8s tasks per batch.
+    """
+
+    template_fields = (
+        *KubernetesPodOperator.template_fields,
+        "site_ids_display",
+    )
+
+    def __init__(self, *args, **kwargs):
+        op_kwargs = kwargs.pop("op_kwargs", {})
+        self.site_ids_display = op_kwargs.get("site_ids", [])
+        super().__init__(*args, **kwargs)
 
 class AirFlowDagCreator:
     def __init__(
@@ -279,8 +294,8 @@ class AirFlowDagCreator:
                 ),
             )
 
-        with DAG(
-            self.dag_name,
+        @dag(
+            dag_id=self.dag_name,
             schedule=timetable,
             start_date=self.start_ts,
             end_date=self.end_ts,
@@ -288,8 +303,8 @@ class AirFlowDagCreator:
             max_active_tasks=self.max_active_tasks,
             catchup=self.catchup,
             params=ParamsDict(dag_params),
-        ) as dag:
-
+        )
+        def build_dag():
             @task(
                 retries=PREFLIGHT_TASK_RETRIES,
                 retry_delay=timedelta(seconds=self.retry_delay_seconds),
@@ -422,22 +437,12 @@ class AirFlowDagCreator:
                 }
             )
 
-            # Create a custom KubernetesPodOperator subclass to add site_ids
-            # to the template fields so they appear in the Airflow UI
-            class CustomKubernetesPodOperator(KubernetesPodOperator):
-                # Add custom template fields for UI display
-                template_fields = (
-                    *KubernetesPodOperator.template_fields,
-                    "site_ids_display",
-                )
-
-                def __init__(self, *args, **kwargs):
-                    # Extract site_ids from op_kwargs if present
-                    op_kwargs = kwargs.pop("op_kwargs", {})
-                    self.site_ids_display = op_kwargs.get("site_ids", [])
-                    super().__init__(*args, **kwargs)
-
-            CustomKubernetesPodOperator.partial(
+            # Use the output of the preflight task to get batch IDs and create K8s task definitions
+            batches = fetch_and_batch_ids()
+            # For each batch, run a task that returns a task definition
+            k8s_task_definitions = create_k8s_task_definition.expand(task_data=batches)
+            # Use the task definitions to create KubernetesPodOperator tasks dynamically
+            _SiteIdsKubernetesPodOperator.partial(
                 task_id="mapped_k8s_tasks",
                 container_resources=k8s_resources,
                 retries=self.task_retries,
@@ -445,8 +450,6 @@ class AirFlowDagCreator:
                 retry_exponential_backoff=self.retry_exponential_backoff,
                 on_finish_action="delete_pod",
                 reattach_on_restart=True,
-            ).expand_kwargs(
-                create_k8s_task_definition.expand(task_data=fetch_and_batch_ids())
-            )
+            ).expand_kwargs(k8s_task_definitions)
 
-        return dag
+        return build_dag()
