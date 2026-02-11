@@ -49,6 +49,7 @@ class PodResources(NamedTuple):
     cpu_request: int = 1000
     ram_request: int = 4000
 
+
 class _SiteIdsKubernetesPodOperator(KubernetesPodOperator):
     """
     KubernetesPodOperator that exposes site_ids in the Airflow UI by adding
@@ -64,6 +65,7 @@ class _SiteIdsKubernetesPodOperator(KubernetesPodOperator):
         op_kwargs = kwargs.pop("op_kwargs", {})
         self.site_ids_display = op_kwargs.get("site_ids", [])
         super().__init__(*args, **kwargs)
+
 
 class AirFlowDagCreator:
     def __init__(
@@ -312,123 +314,14 @@ class AirFlowDagCreator:
             def fetch_and_batch_ids(
                 **context,
             ) -> list[tuple[int, list[int]]]:
-                """
-                Fetch and batch IDs for sites.
-
-                Returns list of tuples: (task_index, site_ids)
-                - If only batch_info: batches by sites
-
-                Supports optional client_id param for filtering sites to a specific client.
-                When client_id is provided via DAG run params, the batch query is modified
-                to filter sites for only that client.
-                """
-                if not self.batch_info:
-                    # There is 1 task, indexed at 0, with no batched IDs.
-                    return [(0, [])]
-
-                # Get optional client from DAG run params or conf (used for backfills)
-                # - params: populated when triggering via Airflow UI
-                # - dag_run.conf: populated when using CLI with --dag-run-conf
-                context = cast(Context, context)
-                params = context.get("params", {})
-                dag_run = context.get("dag_run")
-                conf = dag_run.conf if dag_run and dag_run.conf else {}
-                task_logger.info(f"DAG params debug: params={params}, conf={conf}")
-
-                # Get the client selection (format: "id: name" or None)
-                # Check params first (UI), then conf (CLI --dag-run-conf)
-                client_selection = params.get(CLIENT_PARAM) or conf.get(CLIENT_PARAM)
-                task_logger.info(
-                    f"Client selection: {client_selection!r} (type={type(client_selection).__name__})"
-                )
-
-                site_batches = None
-
-                # Fetch site batches if configured
-                if batch_info_data := self.batch_info:
-                    query = batch_info_data.query
-
-                    rendered_query = self.render_query_template(
-                        template_string=query,
-                        context=context,
-                    )
-                    raw_ids = cast(
-                        List[int], self.fetch_batch_ids(query=rendered_query)
-                    )
-                    if not raw_ids:
-                        task_logger.warning(
-                            "No site IDs fetched from database for batching."
-                        )
-                        return []
-
-                    if size := batch_info_data.size:
-                        site_batches = even_batches(raw_ids, size=size)
-                    else:
-                        site_batches = [raw_ids]
-
-                    task_logger.info(f"Created {len(site_batches)} site batches")
-
-                # Generate tasks based on configuration
-                data = generate_batch_tasks(
-                    site_batches=site_batches,
-                )
-
-                return data
+                return _fetch_and_batch_ids_logic(self=self, context=context)
 
             @task(
                 retries=PREFLIGHT_TASK_RETRIES,
                 retry_delay=timedelta(seconds=self.retry_delay_seconds),
             )
             def create_k8s_task_definition(**kwargs) -> dict:
-                """
-                https://airflow.apache.org/docs/apache-airflow-providers-cncf-kubernetes/stable/_api/airflow/providers/cncf/kubernetes/operators/pod/index.html#airflow.providers.cncf.kubernetes.operators.pod.KubernetesPodOperator
-                """
-                task_data: tuple[int, list[int]] | None = kwargs.get("task_data")
-
-                if not task_data:
-                    task_logger.error("task_data not found in kwargs")
-                    return {}
-
-                task_index, site_ids = task_data
-
-                # Build strings for site_ids
-                site_ids_str = ",".join([str(i) for i in site_ids]) if site_ids else ""
-
-                # Build env vars with batch IDs
-                task_env_vars = self.env_vars.copy()
-                if site_ids_str:
-                    task_env_vars["SITE_IDS"] = site_ids_str
-
-                # Pass client info to pod if specified in DAG params (for logging/debugging)
-                client_selection = kwargs.get("params", {}).get(CLIENT_PARAM)
-                if client_selection is not None:
-                    # Pass the full selection (e.g., "123: Client Name") for better debugging
-                    task_env_vars["CLIENT_FILTER"] = str(client_selection)
-
-                return {
-                    "name": f"{self.dag_name}_task_{task_index}",
-                    "task_id": f"{self.dag_name}_k8s_task_{task_index}",
-                    "namespace": os.environ["KUBERNETES_NAMESPACE"],
-                    "service_account_name": self.service_account_name,
-                    "image": os.environ["LIONFISH_DOCKER_IMAGE"],
-                    "image_pull_policy": "Always",
-                    "cmds": ["python", "-m", "lionfish"],
-                    "arguments": self.base_image_args,
-                    "node_selector": {"powerx.ai/workload": "general-x64"},
-                    "annotations": {
-                        "cluster-autoscaler.kubernetes.io/safe-to-evict": "false",
-                    },
-                    "labels": {
-                        "app": "lionfish",
-                    },
-                    "env_vars": task_env_vars,
-                    "startup_timeout_seconds": self.startup_timeout_seconds,
-                    # Store as op_kwargs for visibility in Airflow UI Details tab
-                    "op_kwargs": {
-                        "site_ids": site_ids,
-                        "task_index": task_index,
-                    },
-                }
+                return _create_k8s_task_definition_logic(self=self, kwargs=kwargs)
 
             k8s_resources = V1ResourceRequirements(
                 requests={
@@ -453,3 +346,107 @@ class AirFlowDagCreator:
             ).expand_kwargs(k8s_task_definitions)
 
         return build_dag()
+
+
+def _fetch_and_batch_ids_logic(
+    self: AirFlowDagCreator, context: Context
+) -> list[tuple[int, list[int]]]:
+    """Fetch and batch IDs for sites and return task mappings."""
+    if not self.batch_info:
+        # There is 1 task, indexed at 0, with no batched IDs.
+        return [(0, [])]
+
+    # Get optional client from DAG run params or conf (used for backfills)
+    # - params: populated when triggering via Airflow UI
+    # - dag_run.conf: populated when using CLI with --dag-run-conf
+    context = cast(Context, context)
+    params = context.get("params", {})
+    dag_run = context.get("dag_run")
+    conf = dag_run.conf if dag_run and dag_run.conf else {}
+    task_logger.info(f"DAG params debug: params={params}, conf={conf}")
+
+    # Get the client selection (format: "id: name" or None)
+    # Check params first (UI), then conf (CLI --dag-run-conf)
+    client_selection = params.get(CLIENT_PARAM) or conf.get(CLIENT_PARAM)
+    task_logger.info(
+        f"Client selection: {client_selection!r} (type={type(client_selection).__name__})"
+    )
+
+    site_batches = None
+
+    # Fetch site batches if configured
+    if batch_info_data := self.batch_info:
+        query = batch_info_data.query
+
+        rendered_query = self.render_query_template(
+            template_string=query,
+            context=context,
+        )
+        raw_ids = cast(List[int], self.fetch_batch_ids(query=rendered_query))
+        if not raw_ids:
+            task_logger.warning("No site IDs fetched from database for batching.")
+            return []
+
+        if size := batch_info_data.size:
+            site_batches = even_batches(raw_ids, size=size)
+        else:
+            site_batches = [raw_ids]
+
+        task_logger.info(f"Created {len(site_batches)} site batches")
+
+    # Generate tasks based on configuration
+    data = generate_batch_tasks(
+        site_batches=site_batches,
+    )
+
+    return data
+
+
+def _create_k8s_task_definition_logic(self: AirFlowDagCreator, kwargs: dict) -> dict:
+    """Build KubernetesPodOperator kwargs for a single batch."""
+    task_data: tuple[int, list[int]] | None = kwargs.get("task_data")
+
+    if not task_data:
+        task_logger.error("task_data not found in kwargs")
+        return {}
+
+    task_index, site_ids = task_data
+
+    # Build strings for site_ids
+    site_ids_str = ",".join([str(i) for i in site_ids]) if site_ids else ""
+
+    # Build env vars with batch IDs
+    task_env_vars = self.env_vars.copy()
+    if site_ids_str:
+        task_env_vars["SITE_IDS"] = site_ids_str
+
+    # Pass client info to pod if specified in DAG params (for logging/debugging)
+    client_selection = kwargs.get("params", {}).get(CLIENT_PARAM)
+    if client_selection is not None:
+        # Pass the full selection (e.g., "123: Client Name") for better debugging
+        task_env_vars["CLIENT_FILTER"] = str(client_selection)
+
+    return {
+        "name": f"{self.dag_name}_task_{task_index}",
+        "task_id": f"{self.dag_name}_k8s_task_{task_index}",
+        "namespace": os.environ["KUBERNETES_NAMESPACE"],
+        "service_account_name": self.service_account_name,
+        "image": os.environ["LIONFISH_DOCKER_IMAGE"],
+        "image_pull_policy": "Always",
+        "cmds": ["python", "-m", "lionfish"],
+        "arguments": self.base_image_args,
+        "node_selector": {"powerx.ai/workload": "general-x64"},
+        "annotations": {
+            "cluster-autoscaler.kubernetes.io/safe-to-evict": "false",
+        },
+        "labels": {
+            "app": "lionfish",
+        },
+        "env_vars": task_env_vars,
+        "startup_timeout_seconds": self.startup_timeout_seconds,
+        # Store as op_kwargs for visibility in Airflow UI Details tab
+        "op_kwargs": {
+            "site_ids": site_ids,
+            "task_index": task_index,
+        },
+    }
