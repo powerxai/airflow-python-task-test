@@ -24,14 +24,12 @@ from utils.generate_batch_tasks import (
     generate_batch_tasks,
 )
 
-from lib.queries import METRIC_CODES_QUERY
 from plugins.timetables import SlidingWindowTimetable
 
 task_logger = logging.getLogger("airflow.task")
 
 CLIENT_PARAM = "Client"
 ALL_CLIENTS_OPTION = "All Clients"
-METRIC_CODES_PARAM = "Metric Codes"
 PREFLIGHT_TASK_RETRIES = (
     5  # Extra retries for fetch_and_batch_ids and create_k8s_task_definition
 )
@@ -40,12 +38,6 @@ PREFLIGHT_TASK_RETRIES = (
 class BatchInfo(NamedTuple):
     size: Optional[int] = None
     query: str = "SELECT id FROM sites.site WHERE deleted = false"
-
-
-class BatchMetricCodesInfo(NamedTuple):
-    size: Optional[int] = None
-    query: str = METRIC_CODES_QUERY
-    raw_metric_codes: Optional[List[str]] = None
 
 
 class PodResources(NamedTuple):
@@ -70,7 +62,6 @@ class AirFlowDagCreator:
         processing_window_hours: float = 24,
         processing_window_lag: int = 0,
         batch_info: Optional[BatchInfo] = None,
-        batch_metric_codes_info: Optional[BatchMetricCodesInfo] = None,
         k8s_pod_resources: PodResources = PodResources(),
         task_retries: int = 2,
         retry_delay_seconds: int = 300,
@@ -127,7 +118,6 @@ class AirFlowDagCreator:
         self.processing_window_hours = processing_window_hours
         self.processing_window_lag = processing_window_lag
         self.batch_info = batch_info
-        self.batch_metric_codes_info = batch_metric_codes_info
         self.k8s_pod_resources = k8s_pod_resources
         self.task_retries = task_retries
         self.retry_delay_seconds = retry_delay_seconds
@@ -289,18 +279,6 @@ class AirFlowDagCreator:
                 ),
             )
 
-        # Only show metric codes param when batch_metric_codes_info is configured
-        if self.batch_metric_codes_info:
-            dag_params[METRIC_CODES_PARAM] = Param(
-                default=None,
-                type=["null", "string"],
-                description=(
-                    "Optional comma-separated list of metric codes to process. "
-                    "If not specified, uses the DAG's configured metric codes. "
-                    "Example: 'AC_PHASE_CURRENT_P1, DC_BUS_VOLTAGE, AIR_TEMPERATURE' (spaces are trimmed)."
-                ),
-            )
-
         with DAG(
             self.dag_name,
             schedule=timetable,
@@ -318,22 +296,20 @@ class AirFlowDagCreator:
             )
             def fetch_and_batch_ids(
                 **context,
-            ) -> list[tuple[int, list[int], list[str]]]:
+            ) -> list[tuple[int, list[int]]]:
                 """
-                Fetch and batch IDs for sites and/or metric codes.
+                Fetch and batch IDs for sites.
 
-                Returns list of tuples: (task_index, site_ids, metric_codes)
+                Returns list of tuples: (task_index, site_ids)
                 - If only batch_info: batches by sites
-                - If only batch_metric_codes_info: batches by metric codes
-                - If both: creates matrix of site_batch x metric_batch
 
                 Supports optional client_id param for filtering sites to a specific client.
                 When client_id is provided via DAG run params, the batch query is modified
                 to filter sites for only that client.
                 """
-                if not self.batch_info and not self.batch_metric_codes_info:
+                if not self.batch_info:
                     # There is 1 task, indexed at 0, with no batched IDs.
-                    return [(0, [], [])]
+                    return [(0, [])]
 
                 # Get optional client from DAG run params or conf (used for backfills)
                 # - params: populated when triggering via Airflow UI
@@ -352,7 +328,6 @@ class AirFlowDagCreator:
                 )
 
                 site_batches = None
-                metric_batches = None
 
                 # Fetch site batches if configured
                 if batch_info_data := self.batch_info:
@@ -378,47 +353,9 @@ class AirFlowDagCreator:
 
                     task_logger.info(f"Created {len(site_batches)} site batches")
 
-                # Get optional metric codes from DAG run params or conf (used for backfills)
-                # Check params first (UI), then conf (CLI --dag-run-conf)
-                metric_codes_param_value = params.get(METRIC_CODES_PARAM) or conf.get(
-                    METRIC_CODES_PARAM
-                )
-                task_logger.info(
-                    f"Metric codes param: {metric_codes_param_value!r} (type={type(metric_codes_param_value).__name__})"
-                )
-
-                # Fetch metric code batches if configured
-                if batch_metric_codes_data := self.batch_metric_codes_info:
-                    if batch_metric_codes_data.raw_metric_codes:
-                        raw_metric_codes = batch_metric_codes_data.raw_metric_codes
-                    else:
-                        context = cast(Context, context)
-                        rendered_query = self.render_query_template(
-                            template_string=batch_metric_codes_data.query,
-                            context=context,
-                        )
-                        raw_metric_codes = cast(
-                            List[str], self.fetch_batch_ids(query=rendered_query)
-                        )
-
-                    if not raw_metric_codes:
-                        raise ValueError(
-                            "No metric codes fetched from database for batching."
-                        )
-
-                    if size := batch_metric_codes_data.size:
-                        metric_batches = even_batches(raw_metric_codes, size=size)
-                    else:
-                        metric_batches = [raw_metric_codes]
-
-                    task_logger.info(
-                        f"Created {len(metric_batches)} metric code batches"
-                    )
-
                 # Generate tasks based on configuration
                 data = generate_batch_tasks(
                     site_batches=site_batches,
-                    metric_batches=metric_batches,
                 )
 
                 return data
@@ -431,37 +368,27 @@ class AirFlowDagCreator:
                 """
                 https://airflow.apache.org/docs/apache-airflow-providers-cncf-kubernetes/stable/_api/airflow/providers/cncf/kubernetes/operators/pod/index.html#airflow.providers.cncf.kubernetes.operators.pod.KubernetesPodOperator
                 """
-                task_data: tuple[int, list[int], list[str]] | None = kwargs.get(
-                    "task_data"
-                )
+                task_data: tuple[int, list[int]] | None = kwargs.get("task_data")
 
                 if not task_data:
                     task_logger.error("task_data not found in kwargs")
                     return {}
 
-                task_index, site_ids, metric_codes = task_data
+                task_index, site_ids = task_data
 
-                # Build strings for site_ids and metric_codes
+                # Build strings for site_ids
                 site_ids_str = ",".join([str(i) for i in site_ids]) if site_ids else ""
-                metric_codes_str = ",".join(metric_codes) if metric_codes else ""
 
-                # Build env vars with batch IDs and metric codes
+                # Build env vars with batch IDs
                 task_env_vars = self.env_vars.copy()
                 if site_ids_str:
                     task_env_vars["SITE_IDS"] = site_ids_str
-                if metric_codes_str:
-                    task_env_vars["METRIC_CODES"] = metric_codes_str
 
                 # Pass client info to pod if specified in DAG params (for logging/debugging)
                 client_selection = kwargs.get("params", {}).get(CLIENT_PARAM)
                 if client_selection is not None:
                     # Pass the full selection (e.g., "123: Client Name") for better debugging
                     task_env_vars["CLIENT_FILTER"] = str(client_selection)
-
-                # Pass metric codes filter info to pod if specified (for logging/debugging)
-                metric_codes_param = kwargs.get("params", {}).get(METRIC_CODES_PARAM)
-                if metric_codes_param is not None and metric_codes_param != "":
-                    task_env_vars["METRIC_CODES_FILTER"] = str(metric_codes_param)
 
                 return {
                     "name": f"{self.dag_name}_task_{task_index}",
@@ -484,7 +411,6 @@ class AirFlowDagCreator:
                     # Store as op_kwargs for visibility in Airflow UI Details tab
                     "op_kwargs": {
                         "site_ids": site_ids,
-                        "metric_codes": metric_codes,
                         "task_index": task_index,
                     },
                 }
@@ -496,21 +422,19 @@ class AirFlowDagCreator:
                 }
             )
 
-            # Create a custom KubernetesPodOperator subclass to add site_ids and metric_codes
+            # Create a custom KubernetesPodOperator subclass to add site_ids
             # to the template fields so they appear in the Airflow UI
             class CustomKubernetesPodOperator(KubernetesPodOperator):
                 # Add custom template fields for UI display
                 template_fields = (
                     *KubernetesPodOperator.template_fields,
                     "site_ids_display",
-                    "metric_codes_display",
                 )
 
                 def __init__(self, *args, **kwargs):
-                    # Extract site_ids and metric_codes from op_kwargs if present
+                    # Extract site_ids from op_kwargs if present
                     op_kwargs = kwargs.pop("op_kwargs", {})
                     self.site_ids_display = op_kwargs.get("site_ids", [])
-                    self.metric_codes_display = op_kwargs.get("metric_codes", [])
                     super().__init__(*args, **kwargs)
 
             CustomKubernetesPodOperator.partial(
