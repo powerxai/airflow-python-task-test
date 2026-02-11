@@ -266,42 +266,6 @@ class AirFlowDagCreator:
             ) from e
         return f"{query} AND client_id = {client_id_int}"
 
-    @classmethod
-    def fetch_valid_metric_codes(cls) -> set[str]:
-        """
-        Fetch all valid (non-deprecated) metric codes from the database.
-
-        Returns:
-            Set of valid metric code strings.
-        """
-        metric_codes = cls.fetch_batch_ids(query=METRIC_CODES_QUERY)
-        return set(cast(List[str], metric_codes))
-
-    @classmethod
-    def validate_metric_codes(
-        cls, metric_codes: list[str], valid_codes: set[str] | None = None
-    ) -> None:
-        """
-        Validate that all provided metric codes exist in the database.
-
-        Logs a warning for any invalid codes but does not fail, since some metric
-        codes may exist in code but not yet in the database (or vice versa).
-
-        Args:
-            metric_codes: List of metric codes to validate.
-            valid_codes: Optional set of valid codes (fetched if not provided).
-        """
-        if valid_codes is None:
-            valid_codes = cls.fetch_valid_metric_codes()
-
-        invalid_codes = [code for code in metric_codes if code not in valid_codes]
-
-        if invalid_codes:
-            task_logger.warning(
-                f"Metric code(s) not found in database (proceeding anyway): {', '.join(invalid_codes)}. "
-                f"These may be defined in code but not yet in the metric_definitions table."
-            )
-
     def create_dag(self):
         timetable = SlidingWindowTimetable(
             cron=self.cron_schedule,
@@ -506,14 +470,14 @@ class AirFlowDagCreator:
                     "service_account_name": self.service_account_name,
                     "image": os.environ["LIONFISH_DOCKER_IMAGE"],
                     "image_pull_policy": "Always",
-                    "cmds": ["python", "-m", "lionfish2"],
+                    "cmds": ["python", "-m", "lionfish"],
                     "arguments": self.base_image_args,
                     "node_selector": {"powerx.ai/workload": "general-x64"},
                     "annotations": {
                         "cluster-autoscaler.kubernetes.io/safe-to-evict": "false",
                     },
                     "labels": {
-                        "app": "lionfish2",
+                        "app": "lionfish",
                     },
                     "env_vars": task_env_vars,
                     "startup_timeout_seconds": self.startup_timeout_seconds,
